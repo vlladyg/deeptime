@@ -98,7 +98,8 @@ sym_inverse.valid_modes = ('trunc', 'regularize', 'clamp')
 
 
 def koopman_matrix(x: "torch.Tensor", y: "torch.Tensor", epsilon: float = 1e-6, mode: str = 'trunc',
-                   c_xx: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None) -> "torch.Tensor":
+                   c_xx: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None,
+                   weights: Optional[Union["torch.Tensor", Tuple["torch.Tensor", "torch.Tensor"]]] = None) -> "torch.Tensor":
     r""" Computes the Koopman matrix
 
     .. math:: K = C_{00}^{-1/2}C_{0t}C_{tt}^{-1/2}
@@ -126,13 +127,14 @@ def koopman_matrix(x: "torch.Tensor", y: "torch.Tensor", epsilon: float = 1e-6, 
     if c_xx is not None:
         c00, c0t, ctt = c_xx
     else:
-        c00, c0t, ctt = covariances(x, y, remove_mean=True)
+        c00, c0t, ctt = covariances(x, y, remove_mean=True, weights=weights)
     c00_sqrt_inv = sym_inverse(c00, return_sqrt=True, epsilon=epsilon, mode=mode)
     ctt_sqrt_inv = sym_inverse(ctt, return_sqrt=True, epsilon=epsilon, mode=mode)
     return multi_dot([c00_sqrt_inv, c0t, ctt_sqrt_inv]).t()
 
 
-def covariances(x: "torch.Tensor", y: "torch.Tensor", remove_mean: bool = True):
+def covariances(x: "torch.Tensor", y: "torch.Tensor", remove_mean: bool = True,
+                weights: Optional[Union["torch.Tensor", Tuple["torch.Tensor", "torch.Tensor"]]] = None):
     """Computes instantaneous and time-lagged covariances matrices.
 
     Parameters
@@ -161,17 +163,58 @@ def covariances(x: "torch.Tensor", y: "torch.Tensor", remove_mean: bool = True):
     assert x.shape == y.shape, "x and y must be of same shape"
     batch_size = x.shape[0]
 
-    if remove_mean:
-        x = x - x.mean(dim=0, keepdim=True)
-        y = y - y.mean(dim=0, keepdim=True)
+    # Prepare weights
+    wx: Optional["torch.Tensor"] = None
+    wy: Optional["torch.Tensor"] = None
+    if weights is not None:
+        if isinstance(weights, tuple):
+            wx, wy = weights
+        else:
+            wx = weights
+            wy = weights
+        # Ensure proper shape (T, 1)
+        if wx is not None:
+            wx = wx.reshape(-1, 1)
+        if wy is not None:
+            wy = wy.reshape(-1, 1)
+        # Move to same device/dtype
+        wx = wx.to(device=x.device, dtype=x.dtype) if wx is not None else None
+        wy = wy.to(device=y.device, dtype=y.dtype) if wy is not None else None
 
-    # Calculate the cross-covariance
+    if remove_mean:
+        if wx is None:
+            x = x - x.mean(dim=0, keepdim=True)
+        else:
+            x_mean = (wx * x).sum(dim=0, keepdim=True) / torch.clamp(wx.sum(), min=1.0)
+            x = x - x_mean
+        if wy is None:
+            y = y - y.mean(dim=0, keepdim=True)
+        else:
+            y_mean = (wy * y).sum(dim=0, keepdim=True) / torch.clamp(wy.sum(), min=1.0)
+            y = y - y_mean
+
+    # Calculate the cross-covariance and auto-covariances
     y_t = y.transpose(0, 1)
     x_t = x.transpose(0, 1)
-    cov_01 = 1 / (batch_size - 1) * torch.matmul(x_t, y)
-    # Calculate the auto-correlations
-    cov_00 = 1 / (batch_size - 1) * torch.matmul(x_t, x)
-    cov_11 = 1 / (batch_size - 1) * torch.matmul(y_t, y)
+    if wx is None and wy is None:
+        denom_x = float(batch_size - 1)
+        denom_y = float(batch_size - 1)
+        cov_01 = (1.0 / denom_x) * torch.matmul(x_t, y)
+        cov_00 = (1.0 / denom_x) * torch.matmul(x_t, x)
+        cov_11 = (1.0 / denom_y) * torch.matmul(y_t, y)
+    else:
+        # Use expectation under weights (no Bessel correction)
+        if wx is None:
+            wx = torch.ones((batch_size, 1), device=x.device, dtype=x.dtype)
+        if wy is None:
+            wy = torch.ones((batch_size, 1), device=y.device, dtype=y.dtype)
+
+        sum_wx = torch.clamp(wx.sum(), min=torch.finfo(x.dtype).eps)
+        sum_wy = torch.clamp(wy.sum(), min=torch.finfo(y.dtype).eps)
+
+        cov_01 = (x_t @ (wx * y)) / sum_wx
+        cov_00 = (x_t @ (wx * x)) / sum_wx
+        cov_11 = (y_t @ (wy * y)) / sum_wy
 
     return cov_00, cov_01, cov_11
 
@@ -179,7 +222,8 @@ def covariances(x: "torch.Tensor", y: "torch.Tensor", remove_mean: bool = True):
 valid_score_methods = ('VAMP1', 'VAMP2', 'VAMPE')
 
 
-def vamp_score(data: "torch.Tensor", data_lagged: "torch.Tensor", method='VAMP2', epsilon: float = 1e-6, mode='trunc'):
+def vamp_score(data: "torch.Tensor", data_lagged: "torch.Tensor", method='VAMP2', epsilon: float = 1e-6, mode='trunc',
+               weights: Optional[Union["torch.Tensor", Tuple["torch.Tensor", "torch.Tensor"]]] = None):
     r"""Computes the VAMP score based on data and corresponding time-shifted data.
 
     Parameters
@@ -206,13 +250,13 @@ def vamp_score(data: "torch.Tensor", data_lagged: "torch.Tensor", method='VAMP2'
                                             f"and {data_lagged.shape}."
     out = None
     if method == 'VAMP1':
-        koopman = koopman_matrix(data, data_lagged, epsilon=epsilon, mode=mode)
+        koopman = koopman_matrix(data, data_lagged, epsilon=epsilon, mode=mode, weights=weights)
         out = torch.norm(koopman, p='nuc')
     elif method == 'VAMP2':
-        koopman = koopman_matrix(data, data_lagged, epsilon=epsilon, mode=mode)
+        koopman = koopman_matrix(data, data_lagged, epsilon=epsilon, mode=mode, weights=weights)
         out = torch.pow(torch.norm(koopman, p='fro'), 2)
     elif method == 'VAMPE':
-        c00, c0t, ctt = covariances(data, data_lagged, remove_mean=True)
+        c00, c0t, ctt = covariances(data, data_lagged, remove_mean=True, weights=weights)
         c00_sqrt_inv = sym_inverse(c00, epsilon=epsilon, return_sqrt=True, mode=mode)
         ctt_sqrt_inv = sym_inverse(ctt, epsilon=epsilon, return_sqrt=True, mode=mode)
         koopman = multi_dot([c00_sqrt_inv, c0t, ctt_sqrt_inv]).t()
@@ -236,10 +280,11 @@ def vamp_score(data: "torch.Tensor", data_lagged: "torch.Tensor", method='VAMP2'
 
 
 def vampnet_loss(data: "torch.Tensor", data_lagged: "torch.Tensor", method='VAMP2', epsilon: float = 1e-6,
-                 mode: str = 'trunc'):
+                 mode: str = 'trunc',
+                 weights: Optional[Union["torch.Tensor", Tuple["torch.Tensor", "torch.Tensor"]]] = None):
     r"""Loss function that can be used to train VAMPNets. It evaluates as :math:`-\mathrm{score}`. The score
     is implemented in :meth:`score`."""
-    return -1. * vamp_score(data, data_lagged, method=method, epsilon=epsilon, mode=mode)
+    return -1. * vamp_score(data, data_lagged, method=method, epsilon=epsilon, mode=mode, weights=weights)
 
 
 class VAMPNetModel(Transformer, Model):
@@ -506,20 +551,32 @@ class VAMPNet(EstimatorTransformer, DLEstimatorMixin):
         self.lobe_timelagged.train()
 
         assert isinstance(data, (list, tuple)) and len(data) == 2, \
-            "Data must be a list or tuple of batches belonging to instantaneous " \
-            "and respective time-lagged data."
+            "Data must be a list or tuple of batches belonging to instantaneous and respective time-lagged data."
 
         batch_0, batch_t = data[0], data[1]
+        weights = None
 
         if isinstance(data[0], np.ndarray):
             batch_0 = torch.from_numpy(data[0].astype(self.dtype)).to(device=self.device)
         if isinstance(data[1], np.ndarray):
             batch_t = torch.from_numpy(data[1].astype(self.dtype)).to(device=self.device)
+        # no explicit weights accepted
+
+        # If no explicit weights provided, interpret last column as weights for both t and t+tau and strip
+        if weights is None:
+            assert batch_0.dim() == 2 and batch_t.dim() == 2 and batch_0.shape[1] >= 2 and batch_t.shape[1] == batch_0.shape[1], \
+                "Expect 2D tensors with last column as weights when not providing explicit weights."
+            w0 = batch_0[:, -1]
+            wt = batch_t[:, -1]
+            weights = (w0, wt)
+            batch_0 = batch_0[:, :-1]
+            batch_t = batch_t[:, :-1]
 
         self.optimizer.zero_grad()
         x_0 = self.lobe(batch_0)
         x_t = self.lobe_timelagged(batch_t)
-        loss_value = vampnet_loss(x_0, x_t, method=self.score_method, epsilon=self.epsilon, mode=self.score_mode)
+        loss_value = vampnet_loss(x_0, x_t, method=self.score_method, epsilon=self.epsilon, mode=self.score_mode,
+                                  weights=weights)
         loss_value.backward()
         self.optimizer.step()
 
@@ -549,9 +606,17 @@ class VAMPNet(EstimatorTransformer, DLEstimatorMixin):
             self.lobe_timelagged.eval()
 
             with torch.no_grad():
-                val = self.lobe(validation_data[0])
-                val_t = self.lobe_timelagged(validation_data[1])
-                score_value = vamp_score(val, val_t, method=self.score_method, mode=self.score_mode, epsilon=self.epsilon)
+                x0_raw, xt_raw = validation_data
+                assert x0_raw.dim() == 2 and xt_raw.dim() == 2 and x0_raw.shape[1] >= 2 and xt_raw.shape[1] == x0_raw.shape[1], \
+                    "Expect 2D tensors with last column as weights for validation."
+                val_w = (x0_raw[:, -1], xt_raw[:, -1])
+                x0_raw = x0_raw[:, :-1]
+                xt_raw = xt_raw[:, :-1]
+
+                val = self.lobe(x0_raw)
+                val_t = self.lobe_timelagged(xt_raw)
+                score_value = vamp_score(val, val_t, method=self.score_method, mode=self.score_mode,
+                                         epsilon=self.epsilon, weights=val_w)
                 return score_value
 
     def fit(self, data_loader: "torch.utils.data.DataLoader", n_epochs=1, validation_loader=None,
@@ -600,9 +665,8 @@ class VAMPNet(EstimatorTransformer, DLEstimatorMixin):
                     with torch.no_grad():
                         scores = []
                         for val_batch in validation_loader:
-                            scores.append(
-                                self.validate((val_batch[0].to(device=self.device), val_batch[1].to(device=self.device)))
-                            )
+                            val_tuple = (val_batch[0].to(device=self.device), val_batch[1].to(device=self.device))
+                            scores.append(self.validate(val_tuple))
                         mean_score = torch.mean(torch.stack(scores))
                         self._validation_scores.append((self._step, mean_score.item()))
                         if validation_score_callback is not None:
